@@ -13,6 +13,13 @@ import numpy as np
 import logging
 import sys
 from vision.ssd.mobilenet_v2_ssd_lite import create_mobilenetv2_ssd_lite, create_mobilenetv2_ssd_lite_predictor
+from tqdm import tqdm
+import torch.nn as nn
+
+
+sys.path.append('/home/cvds_lab/yury/mxt-experiments/nn-quantization-pytorch')
+from quantization.quantizer import ModelQuantizer
+from quantization.posttraining.module_wrapper import ActivationModuleWrapperPost, ParameterModuleWrapperPost
 
 
 parser = argparse.ArgumentParser(description="SSD Evaluation on VOC Dataset.")
@@ -31,6 +38,16 @@ parser.add_argument("--iou_threshold", type=float, default=0.5, help="The thresh
 parser.add_argument("--eval_dir", default="eval_results", type=str, help="The directory to store evaluation results.")
 parser.add_argument('--mb2_width_mult', default=1.0, type=float,
                     help='Width Multiplifier for MobilenetV2')
+
+parser.add_argument('--quantize', '-q', action='store_true', help='Enable quantization', default=False)
+parser.add_argument('--experiment', '-exp', help='Name of the experiment', default='default')
+parser.add_argument('--bit_weights', '-bw', type=int, help='Number of bits for weights', default=None)
+parser.add_argument('--bit_act', '-ba', type=int, help='Number of bits for activations', default=None)
+parser.add_argument('--pre_relu', dest='pre_relu', action='store_true', help='use pre-ReLU quantization')
+parser.add_argument('--qtype', default='max_static', help='Type of quantization method')
+parser.add_argument('-lp', type=float, help='p parameter of Lp norm', default=3.)
+parser.add_argument('--bcorr_w', '-bcw', action='store_true', help='Bias correction for weights', default=False)
+
 args = parser.parse_args()
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() and args.use_cuda else "cpu")
 
@@ -165,15 +182,30 @@ if __name__ == '__main__':
         parser.print_help(sys.stderr)
         sys.exit(1)
 
+    if args.quantize:
+        all_convs = [n for n, m in net.named_modules() if isinstance(m, nn.Conv2d)]
+        all_linear = [n for n, m in net.named_modules() if isinstance(m, nn.Linear)]
+        all_relu = [n for n, m in net.named_modules() if isinstance(m, nn.ReLU)]
+        all_relu6 = [n for n, m in net.named_modules() if isinstance(m, nn.ReLU6)]
+        layers = all_relu + all_relu6 + all_linear + all_convs
+
+        replacement_factory = {nn.ReLU: ActivationModuleWrapperPost,
+                               nn.ReLU6: ActivationModuleWrapperPost,
+                               nn.Linear: ParameterModuleWrapperPost,
+                               nn.Conv2d: ParameterModuleWrapperPost,
+                               nn.Embedding: ActivationModuleWrapperPost}
+        mq = ModelQuantizer(net, args, layers, replacement_factory)
+
+
     results = []
-    for i in range(len(dataset)):
-        print("process image", i)
+    for i in tqdm(range(len(dataset))):
+        # print("process image", i)
         timer.start("Load Image")
         image = dataset.get_image(i)
-        print("Load Image: {:4f} seconds.".format(timer.end("Load Image")))
+        # print("Load Image: {:4f} seconds.".format(timer.end("Load Image")))
         timer.start("Predict")
         boxes, labels, probs = predictor.predict(image)
-        print("Prediction: {:4f} seconds.".format(timer.end("Predict")))
+        # print("Prediction: {:4f} seconds.".format(timer.end("Predict")))
         indexes = torch.ones(labels.size(0), 1, dtype=torch.float32) * i
         results.append(torch.cat([
             indexes.reshape(-1, 1),
